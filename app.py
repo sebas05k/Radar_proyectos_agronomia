@@ -24,6 +24,7 @@ st.set_page_config(page_title="Radar Agro GitHub", page_icon="🌱", layout="wid
 
 CSV_PATH = Path(__file__).parent / "radar_agronomia.csv"
 API = "https://api.github.com"
+REPO_DEFECTO = "sebas05k/Radar_proyectos_agronomia"
 
 # ───────────────────────── Esquema del CSV ─────────────────────────
 COLUMNAS = [
@@ -37,13 +38,13 @@ COLUMNAS = [
 ]
 EDITABLES = [
     "Check", "Favorito", "Prioridad", "Estado", "Dominio Principal",
-    "Tipo de Solución", "Enfoque Geográfico", "Notas_Decision",
+    "Tipo de Solución", "Enfoque Geográfico", "Enlace GitHub", "Notas_Decision",
 ]
 COLUMNAS_VISTA = [
     "Check", "Favorito", "Prioridad", "Estado", "Proyecto", "Autor / Institución",
     "Dominio Principal", "Tipo de Solución", "Enfoque Geográfico", "Lenguaje",
     "Estrellas", "Score", "Enlace GitHub", "Notas_Decision", "Descripción",
-    "Actualizado", "Agregado",
+    "Etiquetas", "Idea / Extracto README", "Actualizado", "Agregado",
 ]
 CAMPOS_BUSQUEDA = [
     "Proyecto", "Autor / Institución", "Dominio Principal", "Tipo de Solución",
@@ -200,10 +201,10 @@ def persistir(df, mensaje):
     """Guarda en disco y, si hay secrets configurados, hace commit del CSV en GitHub."""
     datos = a_csv_bytes(df)
     CSV_PATH.write_bytes(datos)
-    token, repo = secreto("GITHUB_TOKEN"), secreto("GITHUB_REPO")
+    token, repo = secreto("GITHUB_TOKEN"), secreto("GITHUB_REPO", REPO_DEFECTO)
     if not (token and repo):
         return False, ("Guardado solo en el servidor (se pierde si la app se reinicia). "
-                       "Descarga el CSV o configura GITHUB_TOKEN y GITHUB_REPO.")
+                       "Descarga el CSV o configura GITHUB_TOKEN en los secrets.")
     ruta = secreto("GITHUB_CSV_PATH", "radar_agronomia.csv")
     rama = secreto("GITHUB_BRANCH", "main")
     url = f"{API}/repos/{repo}/contents/{ruta}"
@@ -314,6 +315,229 @@ def opciones(df, col, base):
     return sorted(set(base) | {v for v in df[col].unique() if v})
 
 
+
+# ───────────────────────── Temas agronómicos (filtro por palabras clave) ─────────────────────────
+TEMAS = {
+    "Fitomejoramiento y genética": ["plant breeding", "breeding", "genomic", "genotyp", "phenotyp", "qtl",
+                                    "gwas", "germplasm", "fitomejoramiento", "genética"],
+    "Fitopatología y plagas": ["disease", "pest", "pathology", "plaga", "blight", "fungal", "enfermedad", "weed", "病虫害"],
+    "Suelos y nutrición": ["soil", "suelo", "fertiliz", "nutrient", "carbon", "fertilidad"],
+    "Agua y riego": ["irrigation", "riego", "water", "evapotranspiration", "drought", "sequía"],
+    "Clima y agrometeorología": ["weather", "climate", "clima", "rainfall", "phenolog", "meteorolog"],
+    "Agroecología y sostenibilidad": ["agroecolog", "regenerative", "organic", "sustainab", "agroforest",
+                                      "biodiversity", "permacultur"],
+    "Cultivos específicos": ["coffee", "café", "cacao", "cocoa", "palm", "avocado", "aguacate", "banana",
+                             "rice", "maize", "wheat", "soybean", "potato", "tomato", "vegetable"],
+    "Teledetección y agricultura de precisión": ["remote sensing", "satellite", "ndvi", "uav", "drone",
+                                                 "precision agriculture", "gis"],
+    "Modelación y simulación": ["crop model", "simulat", "apsim", "dssat", "aquacrop", "growth model"],
+    "Bioinformática y R": ["bioinformatic", "r package", "cran", "bioconductor", "genome", "sequencing"],
+}
+
+
+def parse_busqueda(q, implicito="AND"):
+    """Sintaxis: ndvi AND cacao | ndvi OR sentinel | "plant breeding" | -maiz | NOT maiz.
+    AND liga más fuerte que OR. Palabras sueltas se unen con `implicito`. Los excluidos son globales."""
+    grupos, excluidos = [[]], []
+    neg = and_expl = prev = False
+    for t in re.findall(r'"[^"]+"|\S+', q):
+        if t in ("OR", "|"):
+            grupos.append([]); prev = and_expl = False
+            continue
+        if t in ("AND", "&"):
+            and_expl = True
+            continue
+        if t == "NOT":
+            neg = True
+            continue
+        negativo = neg or (t.startswith("-") and len(t) > 1)
+        termino = (t.lstrip("-") if t.startswith("-") else t).strip("()").strip('"').lower()
+        neg = False
+        if not termino:
+            continue
+        if negativo:
+            excluidos.append(termino)
+            continue
+        if prev and not and_expl and implicito == "OR":
+            grupos.append([])
+        grupos[-1].append(termino)
+        prev, and_expl = True, False
+    return [g for g in grupos if g], excluidos
+
+
+def mascara_texto(blob, q, implicito="AND"):
+    grupos, excluidos = parse_busqueda(q, implicito)
+    if not grupos and not excluidos:
+        return pd.Series(True, index=blob.index)
+    m = pd.Series(not grupos, index=blob.index)
+    for g in grupos:
+        mg = pd.Series(True, index=blob.index)
+        for term in g:
+            mg &= blob.str.contains(term, regex=False)
+        m |= mg
+    for term in excluidos:
+        m &= ~blob.str.contains(term, regex=False)
+    return m
+
+
+def mascara_temas(blob, temas, modo):
+    if not temas:
+        return pd.Series(True, index=blob.index)
+    ms = [blob.apply(lambda t, k=k: any(_coincide(p, t) for p in TEMAS[k])) for k in temas]
+    return pd.concat(ms, axis=1).all(axis=1) if modo == "todos" else pd.concat(ms, axis=1).any(axis=1)
+
+
+# ───────────────────────── Completar filas existentes desde GitHub ─────────────────────────
+RE_ENLACE = re.compile(r"github\.com/([^/\s]+)/([^/\s#?]+)")
+
+
+def repo_de_enlace(url):
+    m = RE_ENLACE.search(url or "")
+    return (m.group(1), re.sub(r"\.git$", "", m.group(2))) if m else None
+
+
+def elegir_candidato(fila, exactos, permisivo=False):
+    """Devuelve (repo|None, candidatos). Solo acepta si nombre exacto + lenguaje + (estrellas parecidas o autor)."""
+    est = int(fila["Estrellas"] or 0)
+    lang = fila["Lenguaje"].strip().lower()
+    autor = fila["Autor / Institución"].lower()
+    ok_lang = lambda x: not lang or (x.get("language") or "").lower() == lang
+    ok_est = lambda x: abs(x["stargazers_count"] - est) <= max(3, 0.2 * est)
+    ok_autor = lambda x: len(x["owner"]["login"]) >= 3 and x["owner"]["login"].lower() in autor
+    buenos = [x for x in exactos if ok_lang(x) and (ok_est(x) or ok_autor(x))]
+    if len(buenos) > 1:  # desempata por autor y luego por estrellas idénticas; si no, es ambigua
+        for criterio in (ok_autor, lambda x: x["stargazers_count"] == est):
+            sub = [x for x in buenos if criterio(x)]
+            if len(sub) == 1:
+                buenos = sub
+                break
+    if len(buenos) == 1:
+        return buenos[0], exactos, "ok"
+    if permisivo and len(exactos) == 1 and ok_lang(exactos[0]):  # único con ese nombre exacto
+        return exactos[0], exactos, "ok_unico"
+    return None, exactos, "ambigua"
+
+
+def buscar_por_nombre(fila, headers, permisivo=False):
+    nombre = fila["Proyecto"].strip()
+    r = requests.get(f"{API}/search/repositories", headers=headers, timeout=20,
+                     params={"q": f'"{nombre}" in:name', "per_page": 30})
+    if r.status_code in (403, 429):
+        return "limite", None, []
+    if r.status_code != 200:
+        return f"error {r.status_code}", None, []
+    exactos = [x for x in r.json().get("items", []) if x["name"].lower() == nombre.lower()]
+    repo, cands, estado = elegir_candidato(fila, exactos, permisivo)
+    return (estado if cands else "no_existe"), repo, cands
+
+
+def aplicar_repo(df, idx, repo, readme):
+    df.at[idx, "Enlace GitHub"] = repo["html_url"]
+    nuevos = {"Descripción": repo.get("description") or "",
+              "Etiquetas": ", ".join(repo.get("topics", [])),
+              "Idea / Extracto README": readme,
+              "Web / Contacto": repo.get("homepage") or "",
+              "Lenguaje": repo.get("language") or ""}
+    for col, val in nuevos.items():
+        if val and not str(df.at[idx, col]).strip():  # nunca pisa lo que ya tenías
+            df.at[idx, col] = val
+    df.at[idx, "Estrellas"] = repo["stargazers_count"]
+    df.at[idx, "Actualizado"] = repo["updated_at"][:10]
+
+
+def completar_radar(df, forzar, max_filas, progreso, permisivo=True):
+    """Completa metadatos de filas viejas. Filas con enlace usuario/repo -> API directa (en paralelo).
+    Filas con enlace sin usuario -> busca por nombre y solo acepta coincidencias seguras."""
+    h = gh_headers()
+    core, search = None, None
+    try:
+        rl = requests.get(f"{API}/rate_limit", headers=h, timeout=10).json()["resources"]
+        core, search = rl["core"]["remaining"], rl["search"]["remaining"]
+    except Exception:
+        pass
+    sin_usuario = df["Enlace GitHub"].map(lambda u: repo_de_enlace(u) is None)
+    pendiente = df.index[sin_usuario | df["Actualizado"].eq("")] if not forzar else df.index
+    directas = [i for i in pendiente if not sin_usuario[i]]
+    por_nombre = [i for i in pendiente if sin_usuario[i]]
+    res = dict(total_pendientes=len(pendiente), completadas=0, corregidos=0, ambiguas=0,
+               no_existe=0, errores=0, limite=False, restantes=0, por_verificar=0)
+    if core is not None and core < len(directas[:max_filas]):
+        directas = directas[:max(core - 2, 0)]
+        res["limite"] = True
+    directas = directas[:max_filas]
+    por_nombre = por_nombre[:max(max_filas - len(directas), 0)]
+    total = max(len(directas) + len(por_nombre), 1)
+    hecho, resueltos = 0, []  # resueltos: (idx, repo)
+
+    def una(i):
+        o, n = repo_de_enlace(df.at[i, "Enlace GitHub"])
+        return i, requests.get(f"{API}/repos/{o}/{n}", headers=h, timeout=20)
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for i, r in ex.map(una, directas):
+            hecho += 1
+            progreso.progress(hecho / total, text=f"Consultando repos… {hecho}/{total}")
+            if r.status_code == 200:
+                resueltos.append((i, r.json()))
+            elif r.status_code in (403, 429):
+                res["limite"] = True
+            elif r.status_code == 404:
+                res["no_existe"] += 1
+                if not df.at[i, "Notas_Decision"]:
+                    df.at[i, "Notas_Decision"] = "[auto] El enlace ya no existe en GitHub (¿renombrado o borrado?)"
+            else:
+                res["errores"] += 1
+
+    pausa = 2.2 if secreto("GITHUB_TOKEN") else 6.5
+    for i in por_nombre:
+        hecho += 1
+        progreso.progress(hecho / total, text=f"Buscando por nombre: {df.at[i, 'Proyecto']} ({hecho}/{total})")
+        try:
+            estado, repo, cands = buscar_por_nombre(df.loc[i], h, permisivo)
+        except requests.RequestException:
+            res["errores"] += 1
+            continue
+        if estado == "limite":
+            res["limite"] = True
+            break
+        if estado in ("ok", "ok_unico"):
+            resueltos.append((i, repo))
+            res["corregidos"] += 1
+            if estado == "ok_unico":
+                res["por_verificar"] += 1
+                if not df.at[i, "Notas_Decision"]:
+                    df.at[i, "Notas_Decision"] = "[auto] Enlace asignado por ser el único repo con ese nombre; verifícalo"
+        elif estado in ("ambigua", "no_existe") and not df.at[i, "Notas_Decision"]:
+            if estado == "ambigua":
+                res["ambiguas"] += 1
+                top = sorted(cands, key=lambda x: -x["stargazers_count"])[:3]
+                df.at[i, "Notas_Decision"] = "[auto] Enlace sin verificar. Candidatos: " + " | ".join(
+                    f"{x['html_url']} (★{x['stargazers_count']})" for x in top)
+            else:
+                res["no_existe"] += 1
+                df.at[i, "Notas_Decision"] = "[auto] No encontré este repo en GitHub por nombre"
+        elif estado in ("ambigua", "no_existe"):
+            res["ambiguas" if estado == "ambigua" else "no_existe"] += 1
+        else:
+            res["errores"] += 1
+        time.sleep(pausa)
+
+    def leer(par):
+        i, repo = par
+        if str(df.at[i, "Idea / Extracto README"]).strip():
+            return i, repo, ""
+        return i, repo, resumen_readme(repo["owner"]["login"], repo["name"], repo.get("default_branch", "main"))
+
+    progreso.progress(1.0, text="Leyendo README…")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for i, repo, readme in ex.map(leer, resueltos):
+            aplicar_repo(df, i, repo, readme)
+            res["completadas"] += 1
+    sin_usuario = df["Enlace GitHub"].map(lambda u: repo_de_enlace(u) is None)
+    res["restantes"] = int((sin_usuario | df["Actualizado"].eq("")).sum())
+    return res
+
+
 # ───────────────────────── Estado de la sesión ─────────────────────────
 if "df" not in st.session_state:
     st.session_state.df = cargar_csv()
@@ -331,7 +555,12 @@ sb = st.sidebar
 sb.header("Buscar y filtrar")
 vista_rapida = sb.radio("Vista rápida", [
     "Todos", "⭐ Favoritos", "🛠️ Lo estoy haciendo", "🆕 Nuevos por revisar", "✔ Marcados"])
-texto = sb.text_input("🔎 Buscar texto", placeholder="ej: NDVI, cacao, YOLO, Colombia…")
+texto = sb.text_input("🔎 Buscar texto", placeholder='ej: ndvi AND cacao · yolo OR sentinel · -maiz',
+                      help='AND / OR / NOT, "frase exacta" y -excluir. AND liga más fuerte que OR. '
+                           'Ej: ndvi AND colombia OR "plant breeding" -maiz')
+implicito = "OR" if sb.radio("Palabras sin operador", ["todas (AND)", "alguna (OR)"], horizontal=True).startswith("alguna") else "AND"
+f_temas = sb.multiselect("Tema agronómico", list(TEMAS))
+modo_temas = "todos" if sb.radio("Coincidir temas", ["cualquiera", "todos"], horizontal=True) == "todos" else "cualquiera"
 f_estado = sb.multiselect("Estado", opciones(df, "Estado", ESTADOS))
 f_prio = sb.multiselect("Prioridad", opciones(df, "Prioridad", PRIORIDADES))
 f_dom = sb.multiselect("Dominio", opciones(df, "Dominio Principal", list(DOMINIOS) + [DOMINIO_DEFECTO]))
@@ -349,7 +578,7 @@ if sb.button("🔄 Recargar CSV desde disco"):
     st.session_state.ver += 1
     st.rerun()
 sb.caption("GitHub: " + ("con token ✅" if secreto("GITHUB_TOKEN") else "sin token (búsquedas más lentas)")
-           + " · commit al repo: " + ("activo ✅" if secreto("GITHUB_REPO") and secreto("GITHUB_TOKEN") else "no configurado"))
+           + " · commit al repo: " + ("activo ✅" if secreto("GITHUB_TOKEN") else "no configurado"))
 
 mask = pd.Series(True, index=df.index)
 if vista_rapida == "⭐ Favoritos":
@@ -365,14 +594,16 @@ for col, sel in [("Estado", f_estado), ("Prioridad", f_prio), ("Dominio Principa
     if sel:
         mask &= df[col].isin(sel)
 mask &= (df["Estrellas"] >= min_est) & (df["Score"] >= min_score)
-if texto.strip():
+if texto.strip() or f_temas:
     blob = df[CAMPOS_BUSQUEDA].astype(str).agg(" ".join, axis=1).str.lower()
-    for palabra in texto.lower().split():
-        mask &= blob.str.contains(palabra, regex=False)
+    if texto.strip():
+        mask &= mascara_texto(blob, texto, implicito)
+    mask &= mascara_temas(blob, f_temas, modo_temas)
 vista = df[mask].sort_values(orden, ascending=asc, key=(lambda s: s.str.lower()) if orden == "Proyecto" else None)
 
 # ───────────────────────── Pestañas ─────────────────────────
-tab_radar, tab_buscar, tab_resumen = st.tabs(["📋 Mi radar", "🔎 Buscar nuevos en GitHub", "📊 Resumen"])
+tab_radar, tab_buscar, tab_completar, tab_resumen = st.tabs(
+    ["📋 Mi radar", "🔎 Buscar nuevos en GitHub", "✨ Completar datos", "📊 Resumen"])
 
 with tab_radar:
     c1, c2, c3, c4 = st.columns(4)
@@ -383,7 +614,7 @@ with tab_radar:
     st.caption("Edita ✔, ⭐, prioridad, estado, clasificación y notas; luego pulsa **Guardar cambios**. "
                "Guarda antes de cambiar filtros: los cambios sin guardar se descartan.")
 
-    firma = hashlib.md5(repr((vista_rapida, texto, f_estado, f_prio, f_dom, f_tipo, f_geo, f_len,
+    firma = hashlib.md5(repr((vista_rapida, texto, implicito, f_temas, modo_temas, f_estado, f_prio, f_dom, f_tipo, f_geo, f_len,
                               min_est, min_score, orden, asc)).encode()).hexdigest()[:8]
     cfg = {
         "Check": st.column_config.CheckboxColumn("✔", width="small"),
@@ -400,6 +631,8 @@ with tab_radar:
         "Enlace GitHub": st.column_config.LinkColumn("GitHub", display_text=r"https://github\.com/(.*)"),
         "Notas_Decision": st.column_config.TextColumn("Notas", width="medium"),
         "Descripción": st.column_config.TextColumn(width="large"),
+        "Etiquetas": st.column_config.TextColumn(width="medium"),
+        "Idea / Extracto README": st.column_config.TextColumn("README (extracto)", width="large"),
     }
     with st.form("form_radar"):
         editado = st.data_editor(
@@ -470,6 +703,40 @@ with tab_buscar:
                     "GitHub", display_text=r"https://github\.com/(.*)")})
             st.caption("Ya están en *Mi radar* con estado **Nuevo**. "
                        "Dominio y tipo se asignan por palabras clave: corrígelos si hace falta.")
+
+with tab_completar:
+    sin_usuario = df["Enlace GitHub"].map(lambda u: repo_de_enlace(u) is None)
+    pend = int((sin_usuario | df["Actualizado"].eq("")).sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Filas por completar", pend)
+    c2.metric("Enlaces sin usuario/", int(sin_usuario.sum()))
+    c3.metric("Sin descripción", int(df["Descripción"].eq("").sum()))
+    st.write("Rellena **Descripción, Etiquetas, Extracto README, Actualizado, Web/Contacto, Estrellas y el enlace "
+             "usuario/repo** de las filas viejas. Solo llena campos vacíos: no pisa tus notas, estado, favoritos "
+             "ni clasificación. Al terminar hace commit del CSV a GitHub.")
+    st.caption("Los enlaces sin usuario se resuelven buscando por nombre y solo se aceptan si coinciden nombre, "
+               "lenguaje y (estrellas o autor). Los dudosos no se tocan: quedan con una nota `[auto]` en Notas "
+               "con los candidatos, y puedes pegar el enlace correcto en la tabla (la columna GitHub es editable) "
+               "y volver a pulsar el botón.")
+    max_filas = st.slider("Máximo de filas por pasada", 10, 250, 200, step=10)
+    permisivo = st.checkbox("Aceptar también si es el único repo con ese nombre exacto (aunque las estrellas no coincidan)",
+                            value=True, help="Esas filas quedan con una nota [auto] para que las verifiques.")
+    forzar = st.checkbox("Reprocesar también filas ya completas (refresca estrellas y fechas)")
+    t_est = int(min(pend, max_filas) * (2.2 if secreto("GITHUB_TOKEN") else 6.5))
+    st.caption(f"Tiempo estimado: hasta ~{t_est // 60} min {t_est % 60} s "
+               f"(las búsquedas por nombre son lo más lento). "
+               + ("" if secreto("GITHUB_TOKEN") else "⚠️ Sin GITHUB_TOKEN solo hay 60 consultas por hora."))
+    if st.button("✨ Completar descripciones y enlaces desde GitHub", type="primary", disabled=(pend == 0 and not forzar)):
+        barra = st.progress(0.0, text="Iniciando…")
+        res = completar_radar(df, forzar, max_filas, barra, permisivo)
+        ok, msg = persistir(df, f"Radar Agro: completa {res['completadas']} filas desde GitHub")
+        st.session_state.ver += 1
+        st.success(f"Completadas: {res['completadas']} · enlaces corregidos: {res['corregidos']} · "
+                   f"por verificar: {res['por_verificar']} · dudosos: {res['ambiguas']} · no encontrados: {res['no_existe']} · errores: {res['errores']}. {msg}")
+        if res["limite"]:
+            st.warning("Se alcanzó el límite de la API de GitHub; espera y pulsa de nuevo para continuar donde quedó.")
+        if res["restantes"]:
+            st.info(f"Quedan {res['restantes']} filas por completar (dudosas, no encontradas o fuera de esta pasada).")
 
 with tab_resumen:
     a, b = st.columns(2)
