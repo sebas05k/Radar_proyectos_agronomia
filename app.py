@@ -460,12 +460,15 @@ def completar_radar(df, forzar, max_filas, progreso, permisivo=True):
     directas = [i for i in pendiente if not sin_usuario[i]]
     por_nombre = [i for i in pendiente if sin_usuario[i]]
     res = dict(total_pendientes=len(pendiente), completadas=0, corregidos=0, ambiguas=0,
-               no_existe=0, errores=0, limite=False, restantes=0, por_verificar=0)
-    if core is not None and core < len(directas[:max_filas]):
+               no_existe=0, errores=0, limite=False, restantes=0, por_verificar=0, sin_intentar=0)
+    # Las filas con enlace usuario/repo son baratas (API directa): no cuentan para el tope.
+    # El tope aplica solo a las búsquedas por nombre, que son lentas.
+    if core is not None and core < len(directas):
         directas = directas[:max(core - 2, 0)]
         res["limite"] = True
-    directas = directas[:max_filas]
-    por_nombre = por_nombre[:max(max_filas - len(directas), 0)]
+    sin_intentar = max(len(por_nombre) - max_filas, 0)
+    por_nombre = por_nombre[:max_filas]
+    res["sin_intentar"] = sin_intentar
     total = max(len(directas) + len(por_nombre), 1)
     hecho, resueltos = 0, []  # resueltos: (idx, repo)
 
@@ -735,8 +738,13 @@ with tab_completar:
                    f"por verificar: {res['por_verificar']} · dudosos: {res['ambiguas']} · no encontrados: {res['no_existe']} · errores: {res['errores']}. {msg}")
         if res["limite"]:
             st.warning("Se alcanzó el límite de la API de GitHub; espera y pulsa de nuevo para continuar donde quedó.")
-        if res["restantes"]:
-            st.info(f"Quedan {res['restantes']} filas por completar (dudosas, no encontradas o fuera de esta pasada).")
+        if res["sin_intentar"]:
+            st.info(f"Quedan {res['sin_intentar']} filas con enlace sin usuario que no entraron en esta pasada "
+                    "(el máximo solo limita las búsquedas por nombre). Pulsa el botón otra vez.")
+        elif res["restantes"]:
+            st.info(f"Quedan {res['restantes']} filas sin completar: son las dudosas o no encontradas. "
+                    "Cada una tiene una nota [auto] en la columna Notas con lo que pasó. "
+                    "Pega el enlace correcto en la columna GitHub y vuelve a pulsar el botón.")
 
 with tab_resumen:
     a, b = st.columns(2)
