@@ -78,11 +78,30 @@ BUSQUEDAS = [
     dict(grupo="Colombia y español", nombre="Colombia agro", enfoque="Colombia / Latinoamérica",
          q="colombia (agricultura OR agronomia OR cultivos) size:>50 pushed:>{p}"),
     dict(grupo="Colombia y español", nombre="Instituciones Colombia", enfoque="Colombia / Latinoamérica",
-         q="(agrosavia OR ciat OR ideam OR fedecafe OR cenipalma) size:>30"),
+         q="(agrosavia OR ciat OR ideam OR fedecafe OR cenipalma) size:>30",
+         exactas=["agrosavia", "ciat", "ideam", "fedecafe", "cenipalma"]),
     dict(grupo="Colombia y español", nombre="Cultivos clave", enfoque="Colombia / Latinoamérica",
          q="(cafe OR cacao OR palma OR aguacate) (agronomia OR cultivo OR colombia) size:>50"),
     dict(grupo="Colombia y español", nombre="Agronomía en español", enfoque="Colombia / Latinoamérica",
          q="(agronomia OR agricultura) (teledeteccion OR precision OR suelos OR clima) size:>80 pushed:>{p}"),
+    # Listas "awesome": consultas simples sobre el NOMBRE del repo (con OR GitHub devuelve ruido).
+    # Se ordenan por estrellas y no llevan filtro de fecha.
+    dict(grupo="Awesome lists", nombre="Awesome · agriculture", enfoque="Global / Multi-región", orden="stars", n=100,
+         campos="name", q="awesome agriculture stars:>=2"),
+    dict(grupo="Awesome lists", nombre="Awesome · agricultural", enfoque="Global / Multi-región", orden="stars", n=100,
+         campos="name", q="awesome agricultural stars:>=2"),
+    dict(grupo="Awesome lists", nombre="Awesome · agtech", enfoque="Global / Multi-región", orden="stars", n=100,
+         campos="name", q="awesome agtech stars:>=2"),
+    dict(grupo="Awesome lists", nombre="Awesome · farming", enfoque="Global / Multi-región", orden="stars", n=100,
+         campos="name", q="awesome farming stars:>=2"),
+    dict(grupo="Awesome lists", nombre="Awesome · precision agriculture", enfoque="Global / Multi-región", orden="stars", n=100,
+         campos="name", q="awesome precision agriculture stars:>=2"),
+    dict(grupo="Awesome lists", nombre="Awesome · crop models", enfoque="Global / Multi-región", orden="stars", n=100,
+         campos="name", q="awesome crop models stars:>=2"),
+    dict(grupo="Awesome lists", nombre="Awesome · agronomy", enfoque="Global / Multi-región", orden="stars", n=100,
+         campos="name", q="awesome agronomy stars:>=2"),
+    dict(grupo="Awesome lists", nombre="Awesome · por etiqueta", enfoque="Global / Multi-región", orden="stars", n=100,
+         q="topic:awesome (agriculture OR agronomy OR farming OR crop) stars:>=2"),
     # Becas y empleo
     dict(grupo="Becas y empleo", nombre="Becas y empleo (español)", enfoque="Global / Multi-región",
          q="(becas OR convocatoria OR empleo) (agricultura OR agronomia)"),
@@ -254,23 +273,28 @@ def calcular_potencial(repo, resumen):
     return min(p, 10)
 
 
-def buscar_github(consultas, dias, progreso):
+def buscar_github(consultas, dias, progreso, estricto=True):
     fecha = (date.today() - timedelta(days=dias)).isoformat()
     pausa = 2.2 if secreto("GITHUB_TOKEN") else 6.5  # límites: 30 vs 10 búsquedas/min
-    candidatos, avisos = {}, []
+    candidatos, avisos, descartados = {}, [], 0
     for i, b in enumerate(consultas):
         progreso.progress(i / len(consultas), text=f"Buscando: {b['nombre']}…")
         try:
             r = requests.get(
                 f"{API}/search/repositories", headers=gh_headers(), timeout=20,
-                params={"q": b["q"].replace("{p}", fecha), "sort": "updated",
-                        "order": "desc", "per_page": 30})
+                params={"q": b["q"].replace("{p}", fecha) + (
+                            f" in:{b['campos']}" if b.get("campos") else (" in:name,description,topics" if estricto else "")),
+                        "sort": b.get("orden", "updated"),
+                        "order": "desc", "per_page": b.get("n", 30)})
         except requests.RequestException as e:
             avisos.append(f"'{b['nombre']}': error de conexión ({e})")
             continue
         if r.status_code == 200:
             for repo in r.json().get("items", []):
                 if repo.get("archived") or repo.get("fork"):
+                    continue
+                if estricto and not es_relevante_repo(repo, b):
+                    descartados += 1
                     continue
                 candidatos.setdefault(repo["html_url"].lower().rstrip("/"), (repo, b))
         elif r.status_code in (403, 429):
@@ -281,7 +305,7 @@ def buscar_github(consultas, dias, progreso):
             avisos.append(f"'{b['nombre']}': GitHub respondió {r.status_code}")
         time.sleep(pausa)
     progreso.progress(1.0, text="Búsqueda terminada")
-    return candidatos, avisos
+    return candidatos, avisos, descartados
 
 
 def construir_filas(candidatos):
@@ -541,6 +565,162 @@ def completar_radar(df, forzar, max_filas, progreso, permisivo=True):
     return res
 
 
+
+# ───────────────────────── Relevancia, duplicados y depuración ─────────────────────────
+# GitHub busca por subcadenas y dentro del README: por eso entraba ruido. Estas reglas lo filtran.
+AGRO_RE = re.compile(
+    r"\b(agri\w*|agro\w*|agron\w*|agricol\w*|crop|crops|farm|farms|farming|farmer|farmers|farmland|"
+    r"farmbot|farmos|cultiv\w*|horticult\w*|viticult\w*|silvicult\w*|apicultur\w*|irrigation|riego|fertili\w*|"
+    r"pesticid\w*|herbicid\w*|phenotyp\w*|plant (breeding|disease|diseases|pathology|phenotyping|science|health)|"
+    r"plantvillage|plantnet|plantdoc|plantcv|soil|suelos?|cosecha|greenhouse|invernadero|livestock|ganader\w*|"
+    r"fitopat\w*|fitomejor\w*|ndvi|hydroponic\w*|hidropon\w*|aquaponic\w*|microgreen\w*|vineyard|orchard|"
+    r"rendement|teledetection|agroforest\w*|regenerative|evapotranspiration)\b")
+CJK_RE = re.compile(r"农|農|作物|病虫害|作況|เกษตร|โรคพืช|сельск|агро|урожай|земледел")
+
+
+def _tokens(texto):
+    return set(re.findall(r"[a-z0-9áéíóúñü]+", texto.lower()))
+
+
+def tiene_termino_agro(texto):
+    t = re.sub(r"[-_/.]", " ", texto.lower())
+    t = re.sub(r"\b(yield|liquidity|airdrop|crypto\w*|token) farm\w*", "", t)  # DeFi, no agricultura
+    return bool(AGRO_RE.search(t) or CJK_RE.search(t))
+
+
+def pasa_exactas(texto, exactas):
+    """Sigla como palabra completa: 'ideam-tools' sí, 'ideamachine' no."""
+    return bool(_tokens(re.sub(r"[-_/.]", " ", texto)) & set(exactas))
+
+
+def es_relevante_repo(repo, b):
+    texto = " ".join([repo["name"], repo.get("description") or "", " ".join(repo.get("topics", [])),
+                      repo["owner"]["login"]])
+    if b.get("exactas"):
+        return pasa_exactas(texto, b["exactas"])
+    return tiene_termino_agro(" ".join([repo["name"], repo.get("description") or "",
+                                        " ".join(repo.get("topics", []))]))
+
+
+EXACTAS_POR_ORIGEN = {b["nombre"]: b["exactas"] for b in BUSQUEDAS if b.get("exactas")}
+
+
+def motivo_ruido(fila):
+    """Motivo si una fila encontrada por búsqueda parece ruido; None si es razonable."""
+    exactas = EXACTAS_POR_ORIGEN.get(fila["Origen"])
+    if exactas:
+        txt = " ".join([fila["Proyecto"], fila["Descripción"], fila["Etiquetas"], fila["Autor / Institución"]])
+        return None if pasa_exactas(txt, exactas) else "sigla como subcadena (no es la institución)"
+    txt = " ".join([fila["Proyecto"], fila["Descripción"], fila["Etiquetas"], fila["Idea / Extracto README"]])
+    return None if tiene_termino_agro(txt) else "sin términos agronómicos en nombre, descripción, etiquetas ni README"
+
+
+def clave_completa(url):
+    par = repo_de_enlace(url)
+    return f"{par[0]}/{par[1]}".lower() if par else None
+
+
+def indices_conocidos(df):
+    """owner/repo conocidos + nombres (y lenguajes) de filas con enlace sin usuario."""
+    completos, cortos = set(), {}
+    for url, nombre, lang in zip(df["Enlace GitHub"], df["Proyecto"], df["Lenguaje"]):
+        k = clave_completa(url)
+        if k:
+            completos.add(k)
+        else:
+            cortos.setdefault(nombre.strip().lower(), set()).add(str(lang).strip().lower())
+    return completos, cortos
+
+
+def ya_existe(repo, completos, cortos):
+    if repo["full_name"].lower() in completos:
+        return True
+    langs = cortos.get(repo["name"].lower())
+    if langs:
+        lang = (repo.get("language") or "").lower()
+        return any(not l or l == lang for l in langs)
+    return False
+
+
+def _trabajo(fila):
+    """Cuánto trabajo del usuario hay en la fila (para decidir cuál se conserva)."""
+    return (int(bool(fila["Check"])) + int(bool(fila["Favorito"])) + int(fila["Estado"] not in ("Nuevo", "Pendiente"))
+            + int(bool(str(fila["Notas_Decision"]).strip() and not str(fila["Notas_Decision"]).startswith("[auto]")))
+            + int(fila["Origen"] == ""))
+
+
+def fusionar_filas(df, keep, drop):
+    k, d = df.loc[keep], df.loc[drop]
+    for col in ("Check", "Favorito"):
+        df.at[keep, col] = bool(k[col] or d[col])
+    if d["Estado"] not in ("Nuevo", "Pendiente") and k["Estado"] in ("Nuevo", "Pendiente"):
+        df.at[keep, "Estado"] = d["Estado"]
+    df.at[keep, "Prioridad"] = min(k["Prioridad"], d["Prioridad"]) if d["Prioridad"] else k["Prioridad"]
+    nk, nd = str(k["Notas_Decision"]).strip(), str(d["Notas_Decision"]).strip()
+    if nd and not nd.startswith("[auto]") and nd not in nk:
+        df.at[keep, "Notas_Decision"] = (nk + " | " + nd).strip(" |")
+    gana_enlace = repo_de_enlace(d["Enlace GitHub"]) and not repo_de_enlace(k["Enlace GitHub"])
+    if gana_enlace:
+        df.at[keep, "Enlace GitHub"] = d["Enlace GitHub"]
+        if int(d["Estrellas"]) > 0:
+            df.at[keep, "Estrellas"] = int(d["Estrellas"])
+        if str(df.at[keep, "Notas_Decision"]).startswith("[auto]"):
+            df.at[keep, "Notas_Decision"] = ""  # la nota de "enlace sin verificar" ya no aplica
+    for col in ("Descripción", "Etiquetas", "Idea / Extracto README", "Web / Contacto", "Actualizado", "Lenguaje"):
+        if not str(df.at[keep, col]).strip() and str(d[col]).strip():
+            df.at[keep, col] = d[col]
+
+
+def analizar_depuracion(df):
+    """Propone fusiones y eliminaciones. No modifica nada."""
+    plan = dict(exactos=[], cortos=[], ambiguos=[], ruido=[])
+    caidas = set()
+    # 1) mismo owner/repo repetido
+    grupos = {}
+    for i in df.index:
+        k = clave_completa(df.at[i, "Enlace GitHub"])
+        if k:
+            grupos.setdefault(k, []).append(i)
+    for k, idxs in grupos.items():
+        if len(idxs) > 1:
+            idxs = sorted(idxs, key=lambda i: (-_trabajo(df.loc[i]), i))
+            for d in idxs[1:]:
+                plan["exactos"].append((idxs[0], d, "mismo repo repetido"))
+                caidas.add(d)
+    # 2) enlace sin usuario (curado) vs. enlace completo traído por la búsqueda
+    for i in df.index:
+        if i in caidas or clave_completa(df.at[i, "Enlace GitHub"]):
+            continue
+        nombre, lang = df.at[i, "Proyecto"].strip().lower(), str(df.at[i, "Lenguaje"]).strip().lower()
+        cands = [j for j in df.index if j != i and j not in caidas and df.at[j, "Origen"] != ""
+                 and clave_completa(df.at[j, "Enlace GitHub"]) and df.at[j, "Proyecto"].strip().lower() == nombre
+                 and (not lang or str(df.at[j, "Lenguaje"]).strip().lower() in ("", lang))]
+        if len(cands) == 1:
+            plan["cortos"].append((i, cands[0], "enlace sin usuario ya traído con usuario/repo"))
+            caidas.add(cands[0])
+        elif len(cands) > 1:
+            plan["ambiguos"].append((i, len(cands)))
+    # 3) ruido: solo filas traídas por búsqueda, en estado Nuevo y sin tocar por ti
+    for i in df.index:
+        f = df.loc[i]
+        if i in caidas or f["Origen"] == "" or f["Estado"] != "Nuevo" or f["Check"] or f["Favorito"] \
+                or str(f["Notas_Decision"]).strip():
+            continue
+        m = motivo_ruido(f)
+        if m:
+            plan["ruido"].append((i, None, m))
+    return plan
+
+
+def aplicar_depuracion(df, plan):
+    for keep, drop, _ in plan["exactos"] + plan["cortos"]:
+        fusionar_filas(df, keep, drop)
+    quitar = [d for _, d, _ in plan["exactos"] + plan["cortos"]] + [i for i, _, _ in plan["ruido"]]
+    df.drop(index=quitar, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return len(quitar)
+
+
 # ───────────────────────── Estado de la sesión ─────────────────────────
 if "df" not in st.session_state:
     st.session_state.df = cargar_csv()
@@ -605,8 +785,8 @@ if texto.strip() or f_temas:
 vista = df[mask].sort_values(orden, ascending=asc, key=(lambda s: s.str.lower()) if orden == "Proyecto" else None)
 
 # ───────────────────────── Pestañas ─────────────────────────
-tab_radar, tab_buscar, tab_completar, tab_resumen = st.tabs(
-    ["📋 Mi radar", "🔎 Buscar nuevos en GitHub", "✨ Completar datos", "📊 Resumen"])
+tab_radar, tab_buscar, tab_completar, tab_depurar, tab_resumen = st.tabs(
+    ["📋 Mi radar", "🔎 Buscar nuevos en GitHub", "✨ Completar datos", "🧹 Depurar base", "📊 Resumen"])
 
 with tab_radar:
     c1, c2, c3, c4 = st.columns(4)
@@ -671,6 +851,9 @@ with tab_buscar:
     grupos_sel = st.multiselect("Grupos de búsqueda", GRUPOS,
                                  default=[g for g in GRUPOS if g != "Becas y empleo"])
     dias = st.slider("Repos con actividad en los últimos (días)", 30, 730, 365, step=30)
+    estricto = st.checkbox("Modo estricto (recomendado): buscar solo en nombre, descripción y etiquetas, "
+                           "y exigir un término agronómico", value=True,
+                           help="Evita repos que solo mencionan 'agriculture' o 'Colombia' dentro del README.")
     propia = st.text_input("Búsqueda propia (opcional, sintaxis de GitHub)",
                            placeholder='ej: (cacao OR cocoa) (genomics OR breeding) stars:>=2')
     consultas = [b for b in BUSQUEDAS if b["grupo"] in grupos_sel]
@@ -684,13 +867,15 @@ with tab_buscar:
 
     if st.button("🚀 Buscar repos nuevos", type="primary", disabled=not consultas):
         barra = st.progress(0.0, text="Iniciando…")
-        candidatos, avisos = buscar_github(consultas, dias, barra)
-        conocidos = set(df["Enlace GitHub"].str.lower().str.rstrip("/"))
-        nuevos_items = [v for k, v in candidatos.items() if k not in conocidos]
+        candidatos, avisos, descartados = buscar_github(consultas, dias, barra, estricto)
+        completos, cortos = indices_conocidos(df)
+        nuevos_items = [v for v in candidatos.values() if not ya_existe(v[0], completos, cortos)]
+        if descartados:
+            st.caption(f"{descartados} resultados descartados por ruido (sin términos agronómicos o sigla como subcadena).")
         for a in avisos:
             st.warning(a)
         if not nuevos_items:
-            st.success(f"Sin repos nuevos: los {len(candidatos)} encontrados ya estaban en tu radar.")
+            st.success(f"Sin repos nuevos: los {len(candidatos)} relevantes encontrados ya estaban en tu radar.")
         else:
             with st.spinner(f"Leyendo README de {len(nuevos_items)} repos nuevos…"):
                 nuevos = construir_filas(nuevos_items)
@@ -745,6 +930,54 @@ with tab_completar:
             st.info(f"Quedan {res['restantes']} filas sin completar: son las dudosas o no encontradas. "
                     "Cada una tiene una nota [auto] en la columna Notas con lo que pasó. "
                     "Pega el enlace correcto en la columna GitHub y vuelve a pulsar el botón.")
+
+with tab_depurar:
+    st.write("Limpia la base de **duplicados** (incluido el mismo repo con enlace corto y completo) y de "
+             "**ruido** traído por búsquedas. Primero analiza, revisa la lista y luego aplica.")
+    st.caption("Nunca toca tus 182 filas curadas por sí mismas. Solo elimina filas traídas por búsqueda, en estado "
+               "*Nuevo*, sin ✔, sin ⭐ y sin notas. Al fusionar un duplicado conserva tu ✔, ⭐, estado, prioridad y notas.")
+    if st.button("🔍 Analizar base"):
+        st.session_state.plan = analizar_depuracion(df)
+        st.session_state.plan_n = len(df)
+    plan = st.session_state.get("plan")
+    if plan and st.session_state.get("plan_n") != len(df):
+        st.warning("La base cambió desde el análisis. Vuelve a analizar.")
+        plan = None
+    if plan:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Repetidos (mismo repo)", len(plan["exactos"]))
+        c2.metric("Enlace corto + completo", len(plan["cortos"]))
+        c3.metric("Ruido a eliminar", len(plan["ruido"]))
+        c4.metric("Ambiguos (no se tocan)", len(plan["ambiguos"]))
+
+        def tabla(items, titulo):
+            if items:
+                st.subheader(titulo)
+                st.dataframe(pd.DataFrame([{
+                    "Conservar": df.at[k, "Proyecto"] if d is not None else "",
+                    "Enlace conservado": df.at[k, "Enlace GitHub"] if d is not None else "",
+                    "Eliminar": df.at[d if d is not None else k, "Proyecto"],
+                    "Enlace eliminado": df.at[d if d is not None else k, "Enlace GitHub"],
+                    "Motivo": m} for k, d, m in items]), hide_index=True, width="stretch")
+        tabla(plan["exactos"], "Repetidos")
+        tabla(plan["cortos"], "Enlace corto + completo (se fusionan en la fila curada)")
+        tabla(plan["ruido"], "Ruido")
+        if plan["ambiguos"]:
+            st.caption("Ambiguos: " + ", ".join(f"{df.at[i, 'Proyecto']} ({n} candidatos)" for i, n in plan["ambiguos"][:15])
+                       + ". Varios repos con ese nombre; resuélvelos a mano pegando el enlace correcto.")
+        total = len(plan["exactos"]) + len(plan["cortos"]) + len(plan["ruido"])
+        if total:
+            st.download_button("⬇️ Respaldo del CSV antes de aplicar", a_csv_bytes(df), "radar_agronomia_respaldo.csv", "text/csv")
+            ok_conf = st.checkbox(f"Confirmo: eliminar/fusionar {total} filas")
+            if st.button("🧹 Aplicar limpieza y guardar", type="primary", disabled=not ok_conf):
+                n = aplicar_depuracion(df, plan)
+                ok, msg = persistir(df, f"Radar Agro: depura {n} filas (duplicados y ruido)")
+                st.session_state.plan = None
+                st.session_state.msg = f"Depuración aplicada: {n} filas eliminadas o fusionadas. {msg}"
+                st.session_state.ver += 1
+                st.rerun()
+        else:
+            st.success("No hay duplicados ni ruido que depurar.")
 
 with tab_resumen:
     a, b = st.columns(2)
